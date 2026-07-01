@@ -1,4 +1,3 @@
-import base64
 import json
 import re
 from datetime import datetime
@@ -25,7 +24,6 @@ SUPPORTED_CHARTS = (
     "density_heatmap",
     "scatter_matrix",
 )
-SUPPORTED_FORMATS = ("html", "png", "svg")
 SUPPORTED_THEMES = (
     "plotly",
     "plotly_white",
@@ -43,10 +41,14 @@ SUPPORTED_THEMES = (
 PRECONTEXT_PROMPT = """Use tools in this sequence for chart answers:
 1) Use Semantic Search/SQL MCP first to run queries and fetch result rows.
 2) Transform DB rows into Plotly tool input payloads.
-3) Use Plotly MCP tools to generate charts resize to show it in the chat UI.
-4) Save the generated chart to a local file and return the saved file path in the response. 
-5) Show the saved chart in the chat UI directly as image with the file path.
-6) Automatically open the chart file after saving for immediate viewing.
+3) Use a Plotly MCP tool to generate the chart.
+4) Every tool response includes an "html" field containing a complete,
+   self-contained HTML document (Plotly.js is inlined, so it works offline).
+   Render that "html" string directly in the chat UI / preview pane
+   (e.g. as an HTML artifact or inline iframe). Do NOT try to open the
+   "file_path" field — it points to a path on the MCP server's own
+   filesystem and is not reachable by the calling client. It is provided
+   only for reference/debugging.
 """
 
 SCHEMA_PLAYBOOK = {
@@ -114,10 +116,10 @@ def _normalize_data(data: Any) -> dict[str, Any]:
                 data = json.loads(data)
             except Exception:
                 break
-                
+
     if isinstance(data, list):
         return {"rows": data}
-        
+
     if isinstance(data, dict):
         # Unwrap semantic search / smart query / SQL execution formats
         for key in ("results", "data", "rows"):
@@ -131,7 +133,7 @@ def _normalize_data(data: Any) -> dict[str, Any]:
                 if isinstance(val, list):
                     return {"rows": val}
         return data
-        
+
     raise ValueError("data must be a dict, list of rows, or a JSON string")
 
 
@@ -165,19 +167,19 @@ def _data_to_dataframe(chart_data: dict[str, Any]) -> pd.DataFrame:
         if x_data is None and y_data is None:
             raise ValueError("data must include either 'rows' or one of 'x'/'y' fields")
         df = pd.DataFrame({"x": x_data, "y": y_data})
-        
+
     # Auto-detect and format date/time columns
     for col in df.columns:
         if df[col].dtype == object or isinstance(df[col].dtype, pd.CategoricalDtype):
             col_lower = col.lower()
             is_date_col = any(k in col_lower for k in ("date", "time", "created", "updated", "period"))
-            
+
             first_val = df[col].dropna().iloc[0] if not df[col].dropna().empty else None
             is_date_str = False
             if isinstance(first_val, str):
                 if re.match(r'^\d{4}[-/]\d{2}[-/]\d{2}', first_val.strip()):
                     is_date_str = True
-                    
+
             if is_date_col or is_date_str:
                 try:
                     df[col] = pd.to_datetime(df[col])
@@ -196,7 +198,7 @@ def _build_figure(
 ) -> Any:
     chart_type = chart_type.lower().strip()
     if chart_type not in SUPPORTED_CHARTS:
-        raise ValueError(f"Unsupported chart type '{chart_type}'")
+        raise ValueError(f"Unsupported chart type '{chart_type}'. Supported types: {', '.join(SUPPORTED_CHARTS)}")
 
     if chart_type == "heatmap":
         df = None
@@ -319,7 +321,7 @@ def _build_figure(
             if not (isinstance(color_col, str) and color_col in df.columns):
                 color_col = None
             barmode_val = chart_data.get("barmode", "group")
-            
+
             if orientation == "h":
                 fig = px.bar(df, x=actual_y, y=x_col, color=color_col, barmode=barmode_val, orientation=orientation, title=title)
             else:
@@ -343,58 +345,56 @@ def _build_figure(
 
 def _format_output(
     fig: Any,
-    output_format: str,
     output_file: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> str:
-    output_format = output_format.lower().strip()
-    if output_format not in SUPPORTED_FORMATS:
-        raise ValueError(f"Unsupported output format '{output_format}'")
-
-    # Use current working directory
+    """
+    Renders the figure as a self-contained HTML document and returns a JSON
+    string containing both the raw HTML (for inline preview by the calling
+    client) and a saved file path (for reference only).
+    """
     output_dir = Path.cwd() / "chart_outputs"
-    output_dir.mkdir(parents=True, exist_ok=True) 
-    
-    file_extension = output_format
-    auto_name = f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{file_extension}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    auto_name = f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.html"
     output_path = Path(output_file) if output_file else (output_dir / auto_name)
 
-    if output_format == "html":
-        fig.update_layout(width=None, height=None, autosize=True)
-        plotly_config = {
-            "displaylogo": False,
-            "modeBarButtonsToRemove": [
-                "select2d", "lasso2d", "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d"
-            ],
-            "responsive": True
-        }
-        # Keep chart HTML self-contained so iframe rendering works even when
-        # cdn.plot.ly is blocked/unavailable in the user's browser/network.
-        html_content = fig.to_html(include_plotlyjs=True, full_html=True, config=plotly_config)
-        output_path.write_text(html_content, encoding="utf-8")
-        payload = {
-            "saved": True,
-            "format": "html",
-            "file_path": str(output_path.resolve()),
-            "message": "Interactive HTML chart saved successfully.",
-            "metadata": metadata or {},
-        }
-        return json.dumps(payload)
-
-    image_bytes = fig.to_image(format=output_format)
-    payload = {
-        "saved": True,
-        "format": output_format,
-        "file_path": str(output_path.resolve()),
-        "message": f"{output_format.upper()} chart saved successfully.",
-        "metadata": metadata or {},
+    fig.update_layout(width=None, height=None, autosize=True)
+    plotly_config = {
+        "displaylogo": False,
+        "modeBarButtonsToRemove": [
+            "select2d", "lasso2d", "zoomIn2d", "zoomOut2d", "autoScale2d", "resetScale2d"
+        ],
+        "responsive": True
     }
-    output_path.write_bytes(image_bytes)
-    if output_file is None:
-        encoded = base64.b64encode(image_bytes).decode("utf-8")
-        payload["image_confirmation"] = "Image written locally and preview payload included."
-        payload["encoding"] = "base64"
-        payload["content"] = encoded
+    # Self-contained: Plotly.js is inlined so the chart renders even when the
+    # calling client has no internet access or blocks external CDNs.
+    html_content = fig.to_html(include_plotlyjs=True, full_html=True, config=plotly_config)
+
+    try:
+        output_path.write_text(html_content, encoding="utf-8")
+        saved = True
+        file_path = str(output_path.resolve())
+    except Exception:
+        # Filesystem write is best-effort only; the HTML itself is still
+        # returned inline, which is all a remote agent/IDE actually needs.
+        saved = False
+        file_path = None
+
+    payload = {
+        "saved": saved,
+        "format": "html",
+        "file_path": file_path,
+        "content_type": "text/html",
+        "message": (
+            "Chart generated successfully. Render the 'html' field directly "
+            "as an inline HTML preview / artifact in the chat UI. Do not "
+            "attempt to open 'file_path' — it lives on the MCP server, not "
+            "on the calling client's machine."
+        ),
+        "metadata": metadata or {},
+        "html": html_content,
+    }
     return json.dumps(payload)
 
 
@@ -404,8 +404,6 @@ def _build_axis_metadata(
     title: str,
     x_title: str,
     y_title: str,
-    width: int,
-    height: int,
     theme: str,
 ) -> dict[str, Any]:
     x_column = chart_data.get("x_column", "x")
@@ -421,7 +419,6 @@ def _build_axis_metadata(
         "chart_type": chart_type,
         "title": title,
         "theme": theme,
-        "dimensions": {"width": width, "height": height},
         "axes": {
             "x_axis": {"column": x_column, "label": x_axis_label},
             "y_axis": {"column": y_column, "label": y_axis_label},
@@ -441,24 +438,23 @@ def _infer_chart_type_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mapping": {"x": columns[0]} if columns else {},
         }
 
-    # Analyze column data types
     col_types = {}
     col_uniques = {}
-    
+
     for col in columns:
         vals = [row.get(col) for row in rows]
         numeric_count = sum(1 for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool))
         is_numeric = numeric_count >= max(1, int(len(vals) * 0.7))
-        
+
         is_date = False
         date_pattern = r'^\d{4}[-/]\d{2}[-/]\d{2}'
         if any(isinstance(v, str) and re.match(date_pattern, v.strip()) for v in vals if v):
             is_date = True
         elif any(isinstance(v, (datetime, pd.Timestamp)) for v in vals):
             is_date = True
-            
+
         col_uniques[col] = len(set(v for v in vals if v is not None))
-        
+
         if is_numeric:
             col_types[col] = "numeric"
         elif is_date:
@@ -470,7 +466,6 @@ def _infer_chart_type_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     date_cols = [c for c in columns if col_types[c] == "date"]
     categorical_cols = [c for c in columns if col_types[c] == "categorical"]
 
-    # Pattern 1: Multi-series line chart (1 date, 1 categorical, 1 numeric)
     if date_cols and categorical_cols and numeric_cols:
         return {
             "chart_type": "line",
@@ -478,7 +473,6 @@ def _infer_chart_type_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mapping": {"x": date_cols[0], "y": numeric_cols[0], "color_column": categorical_cols[0]}
         }
 
-    # Pattern 2: Grouped/Stacked Bar chart (2 categorical, 1 numeric)
     if len(categorical_cols) >= 2 and numeric_cols:
         c1, c2 = categorical_cols[0], categorical_cols[1]
         if col_uniques[c2] > col_uniques[c1]:
@@ -489,7 +483,6 @@ def _infer_chart_type_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mapping": {"x": c1, "y": numeric_cols[0], "color_column": c2, "barmode": "group"}
         }
 
-    # Pattern 3: Simple time series
     if date_cols and numeric_cols:
         return {
             "chart_type": "line",
@@ -497,7 +490,6 @@ def _infer_chart_type_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mapping": {"x": date_cols[0], "y": numeric_cols[0]}
         }
 
-    # Pattern 4: Status / priority distributions (1 categorical with few unique values, 1 numeric)
     if len(categorical_cols) == 1 and numeric_cols:
         cat = categorical_cols[0]
         num = numeric_cols[0]
@@ -521,7 +513,6 @@ def _infer_chart_type_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "mapping": {"x": cat, "y": num}
             }
 
-    # Pattern 5: Two numeric columns
     if len(numeric_cols) >= 2:
         return {
             "chart_type": "scatter",
@@ -529,7 +520,6 @@ def _infer_chart_type_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "mapping": {"x": numeric_cols[0], "y": numeric_cols[1]}
         }
 
-    # Fallback
     first_col = columns[0]
     second_col = columns[1]
     return {
@@ -550,20 +540,30 @@ def create_chart(
     barmode: str | None = None,
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
     theme: str = "plotly",
     width: Annotated[int, Field(ge=100, le=2000)] = 800,
     height: Annotated[int, Field(ge=100, le=2000)] = 600,
 ) -> str:
     """
-    Create charts with flexible configuration. Automatically infers columns if not provided.
+    Universal chart creator. Builds any supported chart type from data and
+    returns a JSON string with a complete, self-contained HTML document
+    (Plotly.js inlined) in the "html" field.
+
+    IMPORTANT FOR THE CALLING AGENT/IDE: render the "html" field directly
+    as an inline preview (HTML artifact, iframe, browser panel, etc.).
+    Do not try to fetch or open "file_path" — that path is local to this
+    MCP server and is not reachable by you.
+
+    Accepts data as: a dict with "rows" (list of row dicts), a dict with
+    direct "x"/"y" arrays, or a JSON string in either shape. Columns are
+    auto-detected from the first row if x_column/y_column are omitted.
     """
     if theme not in SUPPORTED_THEMES:
-        raise ValueError(f"Unsupported theme '{theme}'")
+        raise ValueError(f"Unsupported theme '{theme}'. Supported themes: {', '.join(SUPPORTED_THEMES)}")
 
     chart_data = _normalize_data(data)
-    
+
     if "rows" in chart_data and isinstance(chart_data["rows"], list) and len(chart_data["rows"]) > 0:
         available_cols = list(chart_data["rows"][0].keys())
         if not x_column:
@@ -582,13 +582,13 @@ def create_chart(
 
     fig = _build_figure(chart_type, chart_data, title=title, x_title=x_title, y_title=y_title, theme=theme)
     fig.update_layout(width=width, height=height)
-    
-    metadata = _build_axis_metadata(chart_type, chart_data, title, x_title, y_title, width, height, theme)
+
+    metadata = _build_axis_metadata(chart_type, chart_data, title, x_title, y_title, theme)
     if "rows" in chart_data and isinstance(chart_data["rows"], list):
         metadata["row_count"] = len(chart_data["rows"])
         metadata["columns"] = list(chart_data["rows"][0].keys()) if chart_data["rows"] else []
-        
-    return _format_output(fig, output_format, output_file, metadata)
+
+    return _format_output(fig, output_file, metadata)
 
 
 @mcp.tool()
@@ -609,32 +609,34 @@ def create_scatter_plot(
     title: str = "Scatter Plot",
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Specialized scatter plot creation. Supports direct list passing or DataFrame/rows query input.
+    Scatter plot for correlation/clustering analysis. Returns a JSON string
+    with a self-contained HTML chart in the "html" field — render that
+    directly for inline preview. Supports direct x_data/y_data lists or a
+    DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
         x_col = x_column or (x if isinstance(x, str) else None)
         y_col = y_column or (y if isinstance(y, str) else None)
-        
+
         if color_column:
             normalized["color"] = color_column
         elif isinstance(colors, str):
             normalized["color"] = colors
-            
+
         if size_column:
             normalized["size"] = size_column
         elif isinstance(sizes, str):
             normalized["size"] = sizes
-            
+
         if label_column:
             normalized["label"] = label_column
         elif isinstance(labels, str):
             normalized["label"] = labels
-            
+
         return create_chart(
             chart_type="scatter",
             data=normalized,
@@ -643,15 +645,14 @@ def create_scatter_plot(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(x_data) or _to_list(x)
     resolved_y = _to_list(y_data) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'x_data' and 'y_data' lists.")
-        
+
     payload = {
         "x": resolved_x,
         "y": resolved_y,
@@ -667,7 +668,6 @@ def create_scatter_plot(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -687,11 +687,13 @@ def create_bar_chart(
     title: str = "Bar Chart",
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Bar chart for categorical data. Supports direct list passing or DataFrame/rows query input.
+    Bar chart for categorical comparisons. Returns a JSON string with a
+    self-contained HTML chart in the "html" field — render that directly
+    for inline preview. Supports direct categories/values lists or a
+    DataFrame/rows-style "data" input.
     """
     orientation_value = "v" if orientation == "vertical" else "h"
     if data is not None:
@@ -710,15 +712,14 @@ def create_bar_chart(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(categories) or _to_list(x)
     resolved_y = _to_list(values) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
-        
+
     payload = {"x": resolved_x, "y": resolved_y, "orientation": orientation_value, "barmode": barmode}
     if color_column:
         payload["color_column"] = color_column
@@ -730,7 +731,6 @@ def create_bar_chart(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -749,11 +749,13 @@ def create_line_chart(
     title: str = "Line Chart",
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Line chart for time series data. Supports direct list passing or DataFrame/rows query input.
+    Line chart for time series / trend data. Returns a JSON string with a
+    self-contained HTML chart in the "html" field — render that directly
+    for inline preview. Supports direct x_data/y_data lists or a
+    DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
@@ -769,15 +771,14 @@ def create_line_chart(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(x_data) or _to_list(x)
     resolved_y = _to_list(y_data) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
-        
+
     rows = [{x_title or "x": resolved_x[i], y_title or line_name: resolved_y[i]} for i in range(min(len(resolved_x), len(resolved_y)))]
     payload = {"rows": rows, "x_column": x_title or "x", "y_column": y_title or line_name}
     if color_column:
@@ -788,7 +789,6 @@ def create_line_chart(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -802,11 +802,13 @@ def create_histogram_chart(
     title: str = "Histogram",
     x_title: str = "Value",
     y_title: str = "Count",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Histogram for distribution analysis. Supports direct list passing or DataFrame/rows query input.
+    Histogram for distribution analysis. Returns a JSON string with a
+    self-contained HTML chart in the "html" field — render that directly
+    for inline preview. Supports a direct values/x list or a
+    DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
@@ -818,14 +820,13 @@ def create_histogram_chart(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(values) or _to_list(x)
     if resolved_x is None:
         raise ValueError("Must provide either 'data' with columns or 'values'/'x' list.")
-        
+
     payload = {"x": resolved_x}
     return create_chart(
         chart_type="histogram",
@@ -834,7 +835,6 @@ def create_histogram_chart(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -851,11 +851,13 @@ def create_box_plot(
     title: str = "Box Plot",
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Box plot for spread and outlier analysis. Supports direct list passing or DataFrame/rows query input.
+    Box plot for spread, quartiles, and outlier analysis. Returns a JSON
+    string with a self-contained HTML chart in the "html" field — render
+    that directly for inline preview. Supports direct categories/values
+    lists or a DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
@@ -869,15 +871,14 @@ def create_box_plot(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(categories) or _to_list(x)
     resolved_y = _to_list(values) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
-        
+
     payload = {"x": resolved_x, "y": resolved_y}
     return create_chart(
         chart_type="box",
@@ -887,7 +888,6 @@ def create_box_plot(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -904,11 +904,13 @@ def create_violin_plot(
     title: str = "Violin Plot",
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Violin plot for distribution shape across groups. Supports direct list passing or DataFrame/rows query input.
+    Violin plot for distribution shape across groups. Returns a JSON string
+    with a self-contained HTML chart in the "html" field — render that
+    directly for inline preview. Supports direct categories/values lists
+    or a DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
@@ -922,15 +924,14 @@ def create_violin_plot(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(categories) or _to_list(x)
     resolved_y = _to_list(values) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
-        
+
     payload = {"x": resolved_x, "y": resolved_y}
     return create_chart(
         chart_type="violin",
@@ -940,7 +941,6 @@ def create_violin_plot(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -955,11 +955,13 @@ def create_pie_chart(
     x_column: str | None = None,
     y_column: str | None = None,
     title: str = "Pie Chart",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Pie chart for composition analysis. Supports direct list passing or DataFrame/rows query input.
+    Pie chart for part-to-whole composition analysis. Returns a JSON
+    string with a self-contained HTML chart in the "html" field — render
+    that directly for inline preview. Supports direct labels/values lists
+    or a DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
@@ -971,15 +973,14 @@ def create_pie_chart(
             x_column=x_col,
             y_column=y_col,
             title=title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(labels) or _to_list(x)
     resolved_y = _to_list(values) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'labels'/'values' lists.")
-        
+
     payload = {"labels": resolved_x, "values": resolved_y, "labels_column": "labels", "values_column": "values"}
     return create_chart(
         chart_type="pie",
@@ -987,7 +988,6 @@ def create_pie_chart(
         x_title="Category",
         y_title="Value",
         title=title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -1004,11 +1004,13 @@ def create_area_chart(
     title: str = "Area Chart",
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Area chart for cumulative trend visualization. Supports direct list passing or DataFrame/rows query input.
+    Area chart for cumulative trend visualization. Returns a JSON string
+    with a self-contained HTML chart in the "html" field — render that
+    directly for inline preview. Supports direct x_data/y_data lists or a
+    DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
@@ -1022,15 +1024,14 @@ def create_area_chart(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(x_data) or _to_list(x)
     resolved_y = _to_list(y_data) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
-        
+
     payload = {"x": resolved_x, "y": resolved_y}
     return create_chart(
         chart_type="area",
@@ -1040,7 +1041,6 @@ def create_area_chart(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -1057,11 +1057,13 @@ def create_density_heatmap(
     title: str = "Density Heatmap",
     x_title: str = "",
     y_title: str = "",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Density heatmap for concentrated regions in bivariate data. Supports direct list passing or DataFrame/rows query input.
+    Density heatmap for concentrated regions in bivariate data. Returns a
+    JSON string with a self-contained HTML chart in the "html" field —
+    render that directly for inline preview. Supports direct x_data/y_data
+    lists or a DataFrame/rows-style "data" input.
     """
     if data is not None:
         normalized = _normalize_data(data)
@@ -1075,15 +1077,14 @@ def create_density_heatmap(
             title=title,
             x_title=x_title,
             y_title=y_title,
-            output_format=output_format,
             output_file=output_file,
         )
-        
+
     resolved_x = _to_list(x_data) or _to_list(x)
     resolved_y = _to_list(y_data) or _to_list(y)
     if resolved_x is None or resolved_y is None:
         raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
-        
+
     payload = {"x": resolved_x, "y": resolved_y}
     return create_chart(
         chart_type="density_heatmap",
@@ -1093,7 +1094,6 @@ def create_density_heatmap(
         title=title,
         x_title=x_title,
         y_title=y_title,
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -1103,11 +1103,12 @@ def create_scatter_matrix(
     data: Any,
     dimensions: list[str] | None = None,
     title: str = "Scatter Matrix",
-    output_format: Literal["html", "png", "svg"] = "html",
     output_file: str | None = None,
 ) -> str:
     """
-    Scatter matrix for multi-variable correlation exploration.
+    Scatter matrix for exploring correlations across multiple numeric
+    columns. Returns a JSON string with a self-contained HTML chart in the
+    "html" field — render that directly for inline preview.
     """
     normalized = _normalize_data(data)
     normalized["dimensions"] = dimensions
@@ -1117,7 +1118,6 @@ def create_scatter_matrix(
         title=title,
         x_title="Multiple Numeric Dimensions",
         y_title="Multiple Numeric Dimensions",
-        output_format=output_format,
         output_file=output_file,
     )
 
@@ -1125,21 +1125,24 @@ def create_scatter_matrix(
 @mcp.tool()
 def get_supported_charts() -> str:
     """
-    List supported chart types and features.
+    Returns the list of supported chart types, themes, and general usage
+    guidance. Call this if you're unsure what chart types or parameters
+    are available before calling create_chart.
     """
     payload = {
         "chart_types": list(SUPPORTED_CHARTS),
-        "output_formats": list(SUPPORTED_FORMATS),
+        "output_format": "html",
         "themes": list(SUPPORTED_THEMES),
         "features": {
-            "static_images_png": "High-quality raster images for documents, presentations, and print materials",
-            "vector_graphics_svg": "Scalable vector graphics with crisp rendering at any size and small file size",
-            "export_requirement": "Kaleido package required for PNG/SVG export",
+            "html_only_output": "Every chart tool returns a complete, self-contained HTML document (Plotly.js inlined) in the 'html' field of the JSON response. Render that field directly in your chat UI / preview pane for an interactive chart. There is no PNG/SVG/image output.",
             "flexible_data_input": "dict, list-of-rows, or JSON string",
             "fastmcp_validation": "decorator-based tools with type validation",
             "detailed_output_metadata": "Every response includes chart metadata with explicit x_axis and y_axis labels",
         },
         "specialized_tools": [
+            "create_scatter_plot",
+            "create_bar_chart",
+            "create_line_chart",
             "create_histogram_chart",
             "create_box_plot",
             "create_violin_plot",
@@ -1160,7 +1163,10 @@ def suggest_chart_from_data(
     user_question: str = "",
 ) -> str:
     """
-    Suggest the best chart type and column mapping from query result rows.
+    Analyzes the shape of the provided data (column types, cardinality) and
+    suggests the best chart_type and column mapping to pass into
+    create_chart. Call this first if you're unsure which chart type fits
+    the data.
     """
     normalized = _normalize_data(data)
     rows = normalized.get("rows")
