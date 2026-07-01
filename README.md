@@ -53,8 +53,12 @@ Plotly MCP Server (this)
     ↓ (charts)
 AI Assistant (displays to user)
 ```
-
+## Authentication
 ## Connect to This MCP Server
+
+**Important**: This MCP server is currently not public. To get authenticated and access the server, please email:
+
+**sarthak.jain854@gmail.com**
 
 This server is live and remotely accessible at:
 
@@ -200,80 +204,6 @@ Key dependencies include:
 - `pydantic` - Data validation
 - `kaleido` - Required for PNG/SVG export (if needed)
 
-## Authentication
-
-**Important**: This MCP server is currently not public. To get authenticated and access the server, please email:
-
-**sarthak.jain854@gmail.com**
-
-Once authenticated, you can use the server with the following setup instructions for your preferred platform:
-
-### Claude Code Setup
-
-```bash
-# Step 1: Add the server
-claude mcp add --scope local --transport http painful-red-limpet https://painful-red-limpet.fastmcp.app/mcp
-
-# Step 2: Select the server
-claude
-/mcp
-
-# Step 3: Authenticate (select your server and authenticate via OAuth)
-```
-
-### Codex Setup
-
-```bash
-# Step 1: Add the server
-codex mcp add --url https://painful-red-limpet.fastmcp.app/mcp painful-red-limpet
-
-# Step 2: Verify configuration
-codex --list-mcp
-```
-
-### Gemini CLI Setup
-
-```bash
-# Step 1: Add the server
-gemini mcp add painful-red-limpet https://painful-red-limpet.fastmcp.app/mcp --transport http
-
-# Step 2: Start session
-gemini
-```
-
-## Running the Server
-
-### Development Mode
-
-```bash
-python server.py
-```
-
-### Production Mode with FastMCP
-
-```bash
-# Run with stdio transport (default)
-python server.py
-
-# Run with SSE transport for web applications
-python server.py --transport sse
-```
-
-### MCP Configuration
-
-Add this server to your MCP client configuration (typically in `~/.config/mcp.json` or similar):
-
-```json
-{
-  "mcpServers": {
-    "plotly": {
-      "command": "python",
-      "args": ["path/to/plotly-server/server.py"],
-      "env": {}
-    }
-  }
-}
-```
 
 ## Available Tools
 
