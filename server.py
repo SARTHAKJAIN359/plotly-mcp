@@ -42,69 +42,14 @@ SUPPORTED_THEMES = (
     "none",
 )
 
-PRECONTEXT_PROMPT = """Use tools in this sequence for chart answers:
-1) Use Semantic Search/SQL MCP first to run queries and fetch result rows.
-2) Transform DB rows into Plotly tool input payloads.
-3) Use Plotly MCP tools to generate charts resize to show it in the chat UI.
-4) Save the generated chart to a local file and return the saved file path in the response. 
-5) Show the saved chart in the chat UI directly as image with the file path.
-6) Automatically open the chart file after saving for immediate viewing.
-"""
-
-SCHEMA_PLAYBOOK = {
-    "tables": {
-        "projects": ["id", "name", "status", "projectType", "progress", "startDate", "latestDueDate", "companyId"],
-        "task": ["id", "taskId", "taskName", "description", "status", "priority", "startDate", "endDate", "progress", "projectId", "companyId"],
-        "subtasks": ["id", "subtaskId", "subtaskName", "description", "status", "priority", "startDate", "endDate", "progress", "taskId", "companyId", "spentTime", "estimationTime"],
-        "goals": ["id", "companyId", "ownerId", "createdById", "createdAt", "updatedAt"],
-        "comments": ["id", "userId", "leaveId", "comment", "commentDate", "createdAt", "updatedAt"],
-        "task_updates": ["id", "updateNotes", "taskId", "companyId", "createdById", "createdAt", "updatedAt"]
-    },
-    "recommended_queries": [
-        {
-            "question": "How many tasks are in each status?",
-            "sql": "SELECT status, COUNT(*) AS task_count FROM task GROUP BY status ORDER BY task_count DESC;",
-            "chart": "bar",
-            "x": "status",
-            "y": "task_count",
-        },
-        {
-            "question": "What is the task status split?",
-            "sql": "SELECT status, COUNT(*) AS task_count FROM task GROUP BY status ORDER BY task_count DESC;",
-            "chart": "pie",
-            "labels": "status",
-            "values": "task_count",
-        },
-        {
-            "question": "Count goals by owner?",
-            "sql": "SELECT \"ownerId\", COUNT(*) AS goal_count FROM goals GROUP BY \"ownerId\" ORDER BY goal_count DESC;",
-            "chart": "bar",
-            "x": "ownerId",
-            "y": "goal_count",
-        },
-        {
-            "question": "How many tasks are created per project?",
-            "sql": "SELECT p.name AS project_name, COUNT(t.id) AS task_count FROM projects p LEFT JOIN task t ON p.id = t.projectId GROUP BY project_name ORDER BY task_count DESC;",
-            "chart": "bar",
-            "x": "project_name",
-            "y": "task_count",
-        },
-        {
-            "question": "How do task progress values vary by priority?",
-            "sql": "SELECT priority, progress FROM task WHERE progress IS NOT NULL;",
-            "chart": "box",
-            "x": "priority",
-            "y": "progress",
-        },
-        {
-            "question": "How many task updates happened over time?",
-            "sql": "SELECT DATE_TRUNC('month', createdAt)::date AS update_month, COUNT(*) AS updates FROM task_updates GROUP BY update_month ORDER BY update_month;",
-            "chart": "line",
-            "x": "update_month",
-            "y": "updates",
-        }
-    ],
-}
+USAGE_NOTES = """This server accepts data as: a list of row dicts, a dict with a
+'rows' key, a dict with 'x'/'y' (or 'labels'/'values') lists, or a JSON string
+encoding any of the above. Column names are auto-detected when x_column /
+y_column are omitted. Output is HTML by default; PNG/SVG export requires the
+optional 'kaleido' package to be installed on the server. If a chart call
+fails, check the 'error' and 'hint' fields in the JSON response for the
+specific cause (unsupported chart type, missing/mismatched columns, or a
+missing image-export dependency)."""
 
 
 def _normalize_data(data: Any) -> dict[str, Any]:
@@ -343,6 +288,51 @@ def _build_figure(
     return fig
 
 
+def _kaleido_available() -> bool:
+    try:
+        import kaleido  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _error_payload(exc: Exception) -> str:
+    """
+    Turn any exception raised while building/saving a chart into a
+    structured JSON error string, instead of letting a raw exception
+    propagate. Different MCP clients (chat UIs, IDE agents, CLI agents)
+    handle unhandled tool exceptions very differently — some show a bare
+    stack trace, some show nothing useful at all. Returning a normal JSON
+    tool result on failure makes behavior consistent and debuggable
+    everywhere, and gives the calling model something to react to.
+    """
+    if isinstance(exc, ValueError):
+        error_type = "invalid_input"
+        hint = ("Check chart_type, and that data has the expected columns "
+                "(or pass x_column/y_column explicitly).")
+    elif isinstance(exc, ImportError):
+        error_type = "missing_dependency"
+        hint = ("PNG/SVG export requires the 'kaleido' package on the "
+                "server. Use output_format='html' instead, or install "
+                "kaleido in this server's Python environment.")
+    elif isinstance(exc, OSError):
+        error_type = "filesystem_error"
+        hint = ("No writable directory was available on the server. If "
+                "the chart was still generated, it may be returned inline "
+                "in the 'html' or 'content' field instead of as a file.")
+    else:
+        error_type = "unexpected_error"
+        hint = ("Unexpected failure while building the chart. Verify the "
+                "data shape matches one described in usage_notes.")
+
+    return json.dumps({
+        "saved": False,
+        "error": f"{type(exc).__name__}: {exc}",
+        "error_type": error_type,
+        "hint": hint,
+    })
+
+
 def _resolve_writable_output_dir() -> Path | None:
     """
     Find a directory we can actually write to. Tries, in order:
@@ -381,6 +371,12 @@ def _format_output(
     output_format = output_format.lower().strip()
     if output_format not in SUPPORTED_FORMATS:
         raise ValueError(f"Unsupported output format '{output_format}'")
+
+    if output_format in ("png", "svg") and not _kaleido_available():
+        raise ImportError(
+            "The 'kaleido' package is not installed on this server, so "
+            f"'{output_format}' export is unavailable."
+        )
 
     file_extension = output_format
     auto_name = f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{file_extension}"
@@ -627,6 +623,20 @@ def create_chart(
     """
     Create charts with flexible configuration. Automatically infers columns if not provided.
     """
+    try:
+        return _create_chart_body(
+            chart_type, data, title, x_column, y_column, color_column,
+            barmode, x_title, y_title, output_format, output_file, theme,
+            width, height,
+        )
+    except Exception as exc:
+        return _error_payload(exc)
+
+
+def _create_chart_body(
+    chart_type, data, title, x_column, y_column, color_column, barmode,
+    x_title, y_title, output_format, output_file, theme, width, height,
+) -> str:
     if theme not in SUPPORTED_THEMES:
         raise ValueError(f"Unsupported theme '{theme}'")
 
@@ -683,61 +693,66 @@ def create_scatter_plot(
     """
     Specialized scatter plot creation. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
         
-        if color_column:
-            normalized["color"] = color_column
-        elif isinstance(colors, str):
-            normalized["color"] = colors
+            if color_column:
+                normalized["color"] = color_column
+            elif isinstance(colors, str):
+                normalized["color"] = colors
             
-        if size_column:
-            normalized["size"] = size_column
-        elif isinstance(sizes, str):
-            normalized["size"] = sizes
+            if size_column:
+                normalized["size"] = size_column
+            elif isinstance(sizes, str):
+                normalized["size"] = sizes
             
-        if label_column:
-            normalized["label"] = label_column
-        elif isinstance(labels, str):
-            normalized["label"] = labels
+            if label_column:
+                normalized["label"] = label_column
+            elif isinstance(labels, str):
+                normalized["label"] = labels
             
+            return create_chart(
+                chart_type="scatter",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(x_data) or _to_list(x)
+        resolved_y = _to_list(y_data) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'x_data' and 'y_data' lists.")
+        
+        payload = {
+            "x": resolved_x,
+            "y": resolved_y,
+            "label": _to_list(labels),
+            "color": _to_list(colors),
+            "size": _to_list(sizes)
+        }
         return create_chart(
             chart_type="scatter",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
+            x_column="x",
+            y_column="y",
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(x_data) or _to_list(x)
-    resolved_y = _to_list(y_data) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'x_data' and 'y_data' lists.")
-        
-    payload = {
-        "x": resolved_x,
-        "y": resolved_y,
-        "label": _to_list(labels),
-        "color": _to_list(colors),
-        "size": _to_list(sizes)
-    }
-    return create_chart(
-        chart_type="scatter",
-        data=payload,
-        x_column="x",
-        y_column="y",
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -761,46 +776,51 @@ def create_bar_chart(
     """
     Bar chart for categorical data. Supports direct list passing or DataFrame/rows query input.
     """
-    orientation_value = "v" if orientation == "vertical" else "h"
-    if data is not None:
-        normalized = _normalize_data(data)
-        normalized["orientation"] = orientation_value
-        normalized["barmode"] = barmode
+    try:
+        orientation_value = "v" if orientation == "vertical" else "h"
+        if data is not None:
+            normalized = _normalize_data(data)
+            normalized["orientation"] = orientation_value
+            normalized["barmode"] = barmode
+            if color_column:
+                normalized["color_column"] = color_column
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
+            return create_chart(
+                chart_type="bar",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(categories) or _to_list(x)
+        resolved_y = _to_list(values) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
+        
+        payload = {"x": resolved_x, "y": resolved_y, "orientation": orientation_value, "barmode": barmode}
         if color_column:
-            normalized["color_column"] = color_column
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+            payload["color_column"] = color_column
         return create_chart(
             chart_type="bar",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
+            x_column="x",
+            y_column="y",
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(categories) or _to_list(x)
-    resolved_y = _to_list(values) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
-        
-    payload = {"x": resolved_x, "y": resolved_y, "orientation": orientation_value, "barmode": barmode}
-    if color_column:
-        payload["color_column"] = color_column
-    return create_chart(
-        chart_type="bar",
-        data=payload,
-        x_column="x",
-        y_column="y",
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -823,42 +843,47 @@ def create_line_chart(
     """
     Line chart for time series data. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            if color_column:
+                normalized["color_column"] = color_column
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
+            return create_chart(
+                chart_type="line",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(x_data) or _to_list(x)
+        resolved_y = _to_list(y_data) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
+        
+        rows = [{x_title or "x": resolved_x[i], y_title or line_name: resolved_y[i]} for i in range(min(len(resolved_x), len(resolved_y)))]
+        payload = {"rows": rows, "x_column": x_title or "x", "y_column": y_title or line_name}
         if color_column:
-            normalized["color_column"] = color_column
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+            payload["color_column"] = color_column
         return create_chart(
             chart_type="line",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(x_data) or _to_list(x)
-    resolved_y = _to_list(y_data) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
-        
-    rows = [{x_title or "x": resolved_x[i], y_title or line_name: resolved_y[i]} for i in range(min(len(resolved_x), len(resolved_y)))]
-    payload = {"rows": rows, "x_column": x_title or "x", "y_column": y_title or line_name}
-    if color_column:
-        payload["color_column"] = color_column
-    return create_chart(
-        chart_type="line",
-        data=payload,
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -876,35 +901,40 @@ def create_histogram_chart(
     """
     Histogram for distribution analysis. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
-        x_col = x_column or (x if isinstance(x, str) else None)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            x_col = x_column or (x if isinstance(x, str) else None)
+            return create_chart(
+                chart_type="histogram",
+                data=normalized,
+                x_column=x_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(values) or _to_list(x)
+        if resolved_x is None:
+            raise ValueError("Must provide either 'data' with columns or 'values'/'x' list.")
+        
+        payload = {"x": resolved_x}
         return create_chart(
             chart_type="histogram",
-            data=normalized,
-            x_column=x_col,
+            data=payload,
+            x_column="x",
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(values) or _to_list(x)
-    if resolved_x is None:
-        raise ValueError("Must provide either 'data' with columns or 'values'/'x' list.")
-        
-    payload = {"x": resolved_x}
-    return create_chart(
-        chart_type="histogram",
-        data=payload,
-        x_column="x",
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -925,39 +955,44 @@ def create_box_plot(
     """
     Box plot for spread and outlier analysis. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
+            return create_chart(
+                chart_type="box",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(categories) or _to_list(x)
+        resolved_y = _to_list(values) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
+        
+        payload = {"x": resolved_x, "y": resolved_y}
         return create_chart(
             chart_type="box",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
+            x_column="x",
+            y_column="y",
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(categories) or _to_list(x)
-    resolved_y = _to_list(values) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
-        
-    payload = {"x": resolved_x, "y": resolved_y}
-    return create_chart(
-        chart_type="box",
-        data=payload,
-        x_column="x",
-        y_column="y",
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -978,39 +1013,44 @@ def create_violin_plot(
     """
     Violin plot for distribution shape across groups. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
+            return create_chart(
+                chart_type="violin",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(categories) or _to_list(x)
+        resolved_y = _to_list(values) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
+        
+        payload = {"x": resolved_x, "y": resolved_y}
         return create_chart(
             chart_type="violin",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
+            x_column="x",
+            y_column="y",
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(categories) or _to_list(x)
-    resolved_y = _to_list(values) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'categories'/'values' lists.")
-        
-    payload = {"x": resolved_x, "y": resolved_y}
-    return create_chart(
-        chart_type="violin",
-        data=payload,
-        x_column="x",
-        y_column="y",
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -1029,35 +1069,40 @@ def create_pie_chart(
     """
     Pie chart for composition analysis. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
+            return create_chart(
+                chart_type="pie",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(labels) or _to_list(x)
+        resolved_y = _to_list(values) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'labels'/'values' lists.")
+        
+        payload = {"labels": resolved_x, "values": resolved_y, "labels_column": "labels", "values_column": "values"}
         return create_chart(
             chart_type="pie",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
+            x_title="Category",
+            y_title="Value",
             title=title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(labels) or _to_list(x)
-    resolved_y = _to_list(values) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'labels'/'values' lists.")
-        
-    payload = {"labels": resolved_x, "values": resolved_y, "labels_column": "labels", "values_column": "values"}
-    return create_chart(
-        chart_type="pie",
-        data=payload,
-        x_title="Category",
-        y_title="Value",
-        title=title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -1078,39 +1123,44 @@ def create_area_chart(
     """
     Area chart for cumulative trend visualization. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
+            return create_chart(
+                chart_type="area",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(x_data) or _to_list(x)
+        resolved_y = _to_list(y_data) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
+        
+        payload = {"x": resolved_x, "y": resolved_y}
         return create_chart(
             chart_type="area",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
+            x_column="x",
+            y_column="y",
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(x_data) or _to_list(x)
-    resolved_y = _to_list(y_data) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
-        
-    payload = {"x": resolved_x, "y": resolved_y}
-    return create_chart(
-        chart_type="area",
-        data=payload,
-        x_column="x",
-        y_column="y",
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -1131,39 +1181,44 @@ def create_density_heatmap(
     """
     Density heatmap for concentrated regions in bivariate data. Supports direct list passing or DataFrame/rows query input.
     """
-    if data is not None:
-        normalized = _normalize_data(data)
-        x_col = x_column or (x if isinstance(x, str) else None)
-        y_col = y_column or (y if isinstance(y, str) else None)
+    try:
+        if data is not None:
+            normalized = _normalize_data(data)
+            x_col = x_column or (x if isinstance(x, str) else None)
+            y_col = y_column or (y if isinstance(y, str) else None)
+            return create_chart(
+                chart_type="density_heatmap",
+                data=normalized,
+                x_column=x_col,
+                y_column=y_col,
+                title=title,
+                x_title=x_title,
+                y_title=y_title,
+                output_format=output_format,
+                output_file=output_file,
+            )
+        
+        resolved_x = _to_list(x_data) or _to_list(x)
+        resolved_y = _to_list(y_data) or _to_list(y)
+        if resolved_x is None or resolved_y is None:
+            raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
+        
+        payload = {"x": resolved_x, "y": resolved_y}
         return create_chart(
             chart_type="density_heatmap",
-            data=normalized,
-            x_column=x_col,
-            y_column=y_col,
+            data=payload,
+            x_column="x",
+            y_column="y",
             title=title,
             x_title=x_title,
             y_title=y_title,
             output_format=output_format,
             output_file=output_file,
         )
-        
-    resolved_x = _to_list(x_data) or _to_list(x)
-    resolved_y = _to_list(y_data) or _to_list(y)
-    if resolved_x is None or resolved_y is None:
-        raise ValueError("Must provide either 'data' with columns or 'x_data'/'y_data' lists.")
-        
-    payload = {"x": resolved_x, "y": resolved_y}
-    return create_chart(
-        chart_type="density_heatmap",
-        data=payload,
-        x_column="x",
-        y_column="y",
-        title=title,
-        x_title=x_title,
-        y_title=y_title,
-        output_format=output_format,
-        output_file=output_file,
-    )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -1177,17 +1232,22 @@ def create_scatter_matrix(
     """
     Scatter matrix for multi-variable correlation exploration.
     """
-    normalized = _normalize_data(data)
-    normalized["dimensions"] = dimensions
-    return create_chart(
-        chart_type="scatter_matrix",
-        data=normalized,
-        title=title,
-        x_title="Multiple Numeric Dimensions",
-        y_title="Multiple Numeric Dimensions",
-        output_format=output_format,
-        output_file=output_file,
-    )
+    try:
+        normalized = _normalize_data(data)
+        normalized["dimensions"] = dimensions
+        return create_chart(
+            chart_type="scatter_matrix",
+            data=normalized,
+            title=title,
+            x_title="Multiple Numeric Dimensions",
+            y_title="Multiple Numeric Dimensions",
+            output_format=output_format,
+            output_file=output_file,
+        )
+
+
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -1195,31 +1255,34 @@ def get_supported_charts() -> str:
     """
     List supported chart types and features.
     """
-    payload = {
-        "chart_types": list(SUPPORTED_CHARTS),
-        "output_formats": list(SUPPORTED_FORMATS),
-        "themes": list(SUPPORTED_THEMES),
-        "features": {
-            "static_images_png": "High-quality raster images for documents, presentations, and print materials",
-            "vector_graphics_svg": "Scalable vector graphics with crisp rendering at any size and small file size",
-            "export_requirement": "Kaleido package required for PNG/SVG export",
-            "flexible_data_input": "dict, list-of-rows, or JSON string",
-            "fastmcp_validation": "decorator-based tools with type validation",
-            "detailed_output_metadata": "Every response includes chart metadata with explicit x_axis and y_axis labels",
-        },
-        "specialized_tools": [
-            "create_histogram_chart",
-            "create_box_plot",
-            "create_violin_plot",
-            "create_pie_chart",
-            "create_area_chart",
-            "create_density_heatmap",
-            "create_scatter_matrix",
-        ],
-        "precontext_prompt": PRECONTEXT_PROMPT,
-        "schema_playbook": SCHEMA_PLAYBOOK,
-    }
-    return json.dumps(payload, indent=2)
+    try:
+        payload = {
+            "chart_types": list(SUPPORTED_CHARTS),
+            "output_formats": list(SUPPORTED_FORMATS),
+            "themes": list(SUPPORTED_THEMES),
+            "features": {
+                "static_images_png": "High-quality raster images for documents, presentations, and print materials",
+                "vector_graphics_svg": "Scalable vector graphics with crisp rendering at any size and small file size",
+                "export_requirement": "Kaleido package required for PNG/SVG export",
+                "kaleido_installed": _kaleido_available(),
+                "flexible_data_input": "dict, list-of-rows, or JSON string",
+                "fastmcp_validation": "decorator-based tools with type validation",
+                "detailed_output_metadata": "Every response includes chart metadata with explicit x_axis and y_axis labels",
+            },
+            "specialized_tools": [
+                "create_histogram_chart",
+                "create_box_plot",
+                "create_violin_plot",
+                "create_pie_chart",
+                "create_area_chart",
+                "create_density_heatmap",
+                "create_scatter_matrix",
+            ],
+            "usage_notes": USAGE_NOTES,
+        }
+        return json.dumps(payload, indent=2)
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 @mcp.tool()
@@ -1230,20 +1293,22 @@ def suggest_chart_from_data(
     """
     Suggest the best chart type and column mapping from query result rows.
     """
-    normalized = _normalize_data(data)
-    rows = normalized.get("rows")
-    if rows is None:
-        df = _data_to_dataframe(normalized)
-        rows = df.to_dict(orient="records")
+    try:
+        normalized = _normalize_data(data)
+        rows = normalized.get("rows")
+        if rows is None:
+            df = _data_to_dataframe(normalized)
+            rows = df.to_dict(orient="records")
 
-    suggestion = _infer_chart_type_from_rows(rows)
-    payload = {
-        "user_question": user_question,
-        "suggestion": suggestion,
-        "recommended_next_step": "Use create_chart with the suggested chart_type and mapping.",
-        "precontext_prompt": PRECONTEXT_PROMPT,
-    }
-    return json.dumps(payload, indent=2)
+        suggestion = _infer_chart_type_from_rows(rows)
+        payload = {
+            "user_question": user_question,
+            "suggestion": suggestion,
+            "recommended_next_step": "Use create_chart with the suggested chart_type and mapping.",
+        }
+        return json.dumps(payload, indent=2)
+    except Exception as exc:
+        return _error_payload(exc)
 
 
 if __name__ == "__main__":
