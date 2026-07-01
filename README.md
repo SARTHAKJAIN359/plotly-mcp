@@ -54,6 +54,98 @@ Plotly MCP Server (this)
 AI Assistant (displays to user)
 ```
 
+## Connect to This MCP Server
+
+This server is live and remotely accessible at:
+
+**`https://plotly-mcp.fastmcp.app/mcp`**
+
+No installation needed — just point any MCP-compatible client at this URL using the **Streamable HTTP** transport.
+
+### Claude Code
+
+```bash
+claude mcp add --transport http plotly-mcp https://plotly-mcp.fastmcp.app/mcp
+```
+
+Then verify it's connected:
+```bash
+claude
+/mcp
+```
+
+### Claude Desktop
+
+Add this to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "plotly-mcp": {
+      "url": "https://plotly-mcp.fastmcp.app/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+Restart Claude Desktop after saving.
+
+### Cursor
+
+Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "plotly-mcp": {
+      "url": "https://plotly-mcp.fastmcp.app/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+
+### Codex CLI
+
+```bash
+codex mcp add --url https://plotly-mcp.fastmcp.app/mcp plotly-mcp
+```
+
+### Gemini CLI
+
+```bash
+gemini mcp add plotly-mcp https://plotly-mcp.fastmcp.app/mcp --transport http
+```
+
+### Any other MCP client (generic config)
+
+Most MCP clients accept a JSON config in this shape — swap in your client's expected key names if they differ:
+
+```json
+{
+  "mcpServers": {
+    "plotly-mcp": {
+      "url": "https://plotly-mcp.fastmcp.app/mcp",
+      "transport": "http"
+    }
+  }
+}
+```
+
+### Using the FastMCP Python client directly
+
+```python
+from fastmcp import Client
+import asyncio
+
+async def main():
+    async with Client("https://plotly-mcp.fastmcp.app/mcp") as client:
+        tools = await client.list_tools()
+        print(tools)
+
+asyncio.run(main())
+```
+
 The server includes a **precontext prompt** that guides AI assistants through the proper workflow:
 
 1. Use Semantic Search/SQL MCP first to run queries and fetch result rows
